@@ -1,50 +1,84 @@
+
 name: Free-Windows-RDP
-on: workflow_dispatch
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   build-rdp:
-    runs-on: windows-latest
-    timeout-minutes: 360
+    runs-on: [self-hosted, Windows, X64]
+    timeout-minutes: 15
+
     steps:
-    - name: Enable RDP
-      run: |
-        Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
-        Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
-        Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
-        netsh advfirewall firewall add rule name="RDP" dir=in action=allow protocol=TCP localport=3389
-        Restart-Service -Name TermService -Force
+      - name: Enable Secure RDP
+        shell: powershell
+        run: |
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+            -Name 'fDenyTSConnections' -Value 0
 
-    - name: Create User
-      run: |
-        $username = "VantaUser"
-        $password = "Vanta@12345"
-        $securePass = ConvertTo-SecureString $password -AsPlainText -Force
-        New-LocalUser -Name $username -Password $securePass -AccountNeverExpires
-        Add-LocalGroupMember -Group "Administrators" -Member $username
-        Add-LocalGroupMember -Group "Remote Desktop Users" -Member $username
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name 'UserAuthentication' -Value 1
 
-    - name: Install Tailscale
-      run: |
-        $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
-        $installerPath = "$env:TEMP\tailscale.msi"
-        Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
-        Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
-        Remove-Item $installerPath -Force
+          Enable-NetFirewallRule -DisplayGroup 'Remote Desktop'
+          Start-Service TermService
 
-    - name: Connect Tailscale
-      run: |
-        & "C:\Program Files\Tailscale\tailscale.exe" up --authkey ${{ secrets.TS_AUTHKEY }} --hostname vanta-rdp
-        Start-Sleep -Seconds 10
-        $ip = & "C:\Program Files\Tailscale\tailscale.exe" ip -4
-        Write-Host "=================================="
-        Write-Host "TAILSCALE IP: $ip"
-        Write-Host "USER: VantaUser"
-        Write-Host "PASS: Vanta@12345"
-        Write-Host "=================================="
+      - name: Install Tailscale
+        shell: powershell
+        run: |
+          $exe = "$env:ProgramFiles\Tailscale\tailscale.exe"
 
-    - name: Keep Alive
-      run: |
-        while ($true) {
-          Start-Sleep -Seconds 300
-          Write-Host "Alive at $(Get-Date)"
-        }
+          if (!(Test-Path $exe)) {
+            $msi = "$env:TEMP\tailscale.msi"
+
+            Invoke-WebRequest `
+              'https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi' `
+              -OutFile $msi
+
+            $p = Start-Process msiexec.exe `
+              -ArgumentList "/i `"$msi`" /quiet /norestart" `
+              -Wait -PassThru
+
+            if ($p.ExitCode -ne 0) {
+              throw "Tailscale installation failed: $($p.ExitCode)"
+            }
+
+            Remove-Item $msi -Force
+          }
+
+      - name: Connect Tailscale
+        shell: powershell
+        env:
+          TS_AUTHKEY: ${{ secrets.TS_AUTHKEY }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:TS_AUTHKEY)) {
+            throw "TS_AUTHKEY secret is missing"
+          }
+
+          $exe = "$env:ProgramFiles\Tailscale\tailscale.exe"
+
+          & $exe up --authkey="$env:TS_AUTHKEY" --hostname=windows-rdp
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Tailscale connection failed"
+          }
+
+          Start-Sleep -Seconds 5
+
+          $ip = & $exe ip -4
+
+          Write-Host "Tailscale IP: $ip"
+          Write-Host "RDP Port: 3389"
+          Write-Host "Use your existing Windows account."
+
+      - name: Verify RDP
+        shell: powershell
+        run: |
+          Get-Service TermService
+          Get-NetFirewallRule -DisplayGroup 'Remote Desktop' |
+            Select-Object DisplayName, Enabled
+          Write-Host "Setup completed"
